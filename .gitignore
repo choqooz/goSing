@@ -1,0 +1,24 @@
+# Entornos de desarrollo e instaladores
+node_modules/
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Binarios de Go
+/gosing
+/main
+*.exe
+
+# Artefactos del SO y logs
+.DS_Store
+*.log
+
+# Datos de la app y descargas temporales
+cookies.txt
+/worker/separated/
+*.mp3
+*.wav
+
+# Gentle AI y configs locales (opcional ignorarlo, pero lo agregamos por seguridad)
+.agents/
