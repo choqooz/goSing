@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,13 +11,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
+	"github.com/chocolate/gosing/internal/adapters"
 	"github.com/chocolate/gosing/internal/core"
 )
 
 type AudioHandler struct {
-	processor core.AudioProcessor
+	processor     core.AudioProcessor
+	suggestClient *http.Client
+	runSearch     func(context.Context, string) ([]byte, error)
+	runDownload   func(context.Context, string, string) error
+	tempDir       string
 }
 
 type SearchResult struct {
@@ -26,7 +35,7 @@ type SearchResult struct {
 }
 
 func NewAudioHandler(p core.AudioProcessor) *AudioHandler {
-	return &AudioHandler{processor: p}
+	return &AudioHandler{processor: p, suggestClient: &http.Client{Timeout: suggestionTimeout}, runSearch: searchYouTube, runDownload: downloadAudio, tempDir: os.TempDir()}
 }
 
 // SuggestYouTube devuelve sugerencias de autocompletado ultra rápidas.
@@ -39,15 +48,29 @@ func (h *AudioHandler) SuggestYouTube(w http.ResponseWriter, r *http.Request) {
 	}
 
 	apiUrl := fmt.Sprintf("https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=%s", url.QueryEscape(query))
-	res, err := http.Get(apiUrl)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, apiUrl, nil)
 	if err != nil {
 		http.Error(w, "failed to get suggestions", http.StatusInternalServerError)
 		return
 	}
+	res, err := h.suggestClient.Do(req)
+	if err != nil {
+		http.Error(w, "failed to get suggestions", requestErrorStatus(err))
+		return
+	}
 	defer res.Body.Close()
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		http.Error(w, "failed to get suggestions", http.StatusBadGateway)
+		return
+	}
+	payload, err := io.ReadAll(io.LimitReader(res.Body, maxSuggestionResponse+1))
+	if err != nil || len(payload) > maxSuggestionResponse {
+		http.Error(w, "failed to get suggestions", http.StatusBadGateway)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	io.Copy(w, res.Body)
+	w.Write(payload)
 }
 
 // SearchYouTube busca en YouTube usando yt-dlp.
@@ -58,11 +81,13 @@ func (h *AudioHandler) SearchYouTube(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Buscamos 10 resultados, ordenados por relevancia (por defecto en ytsearch)
-	args := []string{fmt.Sprintf("ytsearch10:%s", query), "--dump-json", "--ignore-errors", "--no-warnings", "--flat-playlist", "-v"}
-	cmd := exec.Command("yt-dlp", args...)
-	cmd.Stderr = os.Stderr // Redirigir errores y logs informativos a la terminal para poder ver si las cookies funcionan
-	out, _ := cmd.Output()
+	ctx, cancel := context.WithTimeout(r.Context(), youtubeSearchTimeout)
+	defer cancel()
+	out, err := h.runSearch(ctx, query)
+	if err != nil {
+		http.Error(w, "failed to search", requestErrorStatus(commandError(ctx, err)))
+		return
+	}
 
 	if len(out) == 0 {
 		http.Error(w, "failed to search", http.StatusInternalServerError)
@@ -105,8 +130,8 @@ func (h *AudioHandler) SearchYouTube(w http.ResponseWriter, r *http.Request) {
 // POST /api/audio/upload
 func (h *AudioHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	// 1. Limitar tamaño a 20MB (protege la memoria de tu VPS gratuito)
-	r.Body = http.MaxBytesReader(w, r.Body, 20<<20)
-	if err := r.ParseMultipartForm(20 << 20); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAudioSize)
+	if err := r.ParseMultipartForm(maxAudioSize); err != nil {
 		http.Error(w, "Archivo muy pesado o inválido", http.StatusBadRequest)
 		return
 	}
@@ -119,20 +144,32 @@ func (h *AudioHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	// Preserve the format suffix without letting client input control the path.
+	ext := strings.ToLower(filepath.Ext(handler.Filename))
+	if !allowedAudioExtensions[ext] {
+		http.Error(w, "Formato de audio inválido", http.StatusBadRequest)
+		return
+	}
+
 	// 3. Guardar temporalmente (cumpliendo la regla del PRD: procesamiento efímero)
-	tmpPath := filepath.Join("/tmp", handler.Filename)
-	dst, err := os.Create(tmpPath)
+	dst, err := os.CreateTemp(h.tempDir, "gosing-upload-*"+ext)
 	if err != nil {
 		http.Error(w, "Error interno guardando archivo", http.StatusInternalServerError)
 		return
 	}
-	defer dst.Close()
-	io.Copy(dst, file)
+	tmpPath := dst.Name()
+	defer os.Remove(tmpPath)
+	_, copyErr := io.Copy(dst, file)
+	closeErr := dst.Close()
+	if copyErr != nil || closeErr != nil {
+		http.Error(w, "Error interno guardando archivo", http.StatusInternalServerError)
+		return
+	}
 
 	// 4. Iniciar aislamiento pasándole la ruta temporal al adaptador inyectado
 	jobID, err := h.processor.StartIsolation(r.Context(), tmpPath)
 	if err != nil {
-		http.Error(w, "Error iniciando la IA", http.StatusInternalServerError)
+		writeWorkerError(w, err)
 		return
 	}
 
@@ -151,7 +188,16 @@ func (h *AudioHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 
 	job, err := h.processor.CheckStatus(r.Context(), jobID)
 	if err != nil {
-		http.Error(w, "Trabajo no encontrado", http.StatusNotFound)
+		var workerErr *adapters.WorkerHTTPError
+		if errors.As(err, &workerErr) && workerErr.StatusCode == http.StatusNotFound {
+			http.Error(w, "Trabajo no encontrado", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "Error consultando la IA", http.StatusGatewayTimeout)
+			return
+		}
+		http.Error(w, "Error consultando la IA", http.StatusInternalServerError)
 		return
 	}
 
@@ -171,35 +217,91 @@ func (h *AudioHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.VideoID == "" {
+	if !youtubeIDPattern.MatchString(req.VideoID) {
 		http.Error(w, "Falta videoId", http.StatusBadRequest)
 		return
 	}
 
-	tmpPath := filepath.Join("/tmp", fmt.Sprintf("%s.mp3", req.VideoID))
-	url := fmt.Sprintf("https://youtube.com/watch?v=%s", req.VideoID)
-
-	args := []string{
-		"-f", "bestaudio",
-		"--extract-audio",
-		"--audio-format", "mp3",
-		"-o", tmpPath,
-		"-v",
-		url,
+	tmpDir, err := os.MkdirTemp(h.tempDir, "gosing-download-*")
+	if err != nil {
+		http.Error(w, "Error descargando audio", http.StatusInternalServerError)
+		return
 	}
-	cmd := exec.Command("yt-dlp", args...)
-	cmd.Stderr = os.Stderr // Mostrar progreso en la terminal
-	if err := cmd.Run(); err != nil {
+	defer os.RemoveAll(tmpDir)
+	tmpPath := filepath.Join(tmpDir, "audio.mp3")
+	ctx, cancel := context.WithTimeout(r.Context(), youtubeDownloadTimeout)
+	defer cancel()
+	if err := h.runDownload(ctx, req.VideoID, tmpPath); err != nil {
+		http.Error(w, "Error descargando audio", requestErrorStatus(commandError(ctx, err)))
+		return
+	}
+	info, err := os.Stat(tmpPath)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxAudioSize {
 		http.Error(w, "Error descargando audio", http.StatusInternalServerError)
 		return
 	}
 
 	jobID, err := h.processor.StartIsolation(r.Context(), tmpPath)
 	if err != nil {
-		http.Error(w, "Error iniciando la IA", http.StatusInternalServerError)
+		writeWorkerError(w, err)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"job_id": jobID})
+}
+
+const (
+	maxAudioSize           = 20 << 20
+	suggestionTimeout      = 5 * time.Second
+	maxSuggestionResponse  = 1 << 20
+	youtubeSearchTimeout   = 20 * time.Second // Search is interactive and must not occupy a request indefinitely.
+	youtubeDownloadTimeout = 5 * time.Minute  // Audio extraction is expected to take longer than search.
+)
+
+var (
+	allowedAudioExtensions = map[string]bool{".mp3": true, ".wav": true, ".m4a": true, ".ogg": true, ".flac": true}
+	youtubeIDPattern       = regexp.MustCompile(`^[A-Za-z0-9_-]{11}$`)
+)
+
+func downloadAudio(ctx context.Context, videoID, outputPath string) error {
+	args := []string{
+		"-f", "bestaudio", "--extract-audio", "--audio-format", "mp3",
+		"-o", outputPath, "-v", "https://youtube.com/watch?v=" + videoID,
+	}
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func searchYouTube(ctx context.Context, query string) ([]byte, error) {
+	args := []string{fmt.Sprintf("ytsearch10:%s", query), "--dump-json", "--ignore-errors", "--no-warnings", "--flat-playlist", "-v"}
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	cmd.Stderr = os.Stderr
+	return cmd.Output()
+}
+
+func requestErrorStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return http.StatusRequestTimeout
+	}
+	return http.StatusInternalServerError
+}
+
+func commandError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+func writeWorkerError(w http.ResponseWriter, err error) {
+	if errors.Is(err, adapters.ErrWorkerRateLimited) {
+		http.Error(w, "La IA está ocupada, intentá nuevamente", http.StatusTooManyRequests)
+		return
+	}
+	http.Error(w, "Error iniciando la IA", requestErrorStatus(err))
 }

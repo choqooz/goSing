@@ -8,6 +8,7 @@ type AudioJob struct {
 	Status          string `json:"status"` // "processing", "completed", "failed"
 	InstrumentalURL string `json:"instrumental_url"`
 	VocalURL        string `json:"vocal_url"`
+	Error           string `json:"error,omitempty"`
 }
 
 // AudioProcessor es EL PUERTO (El contrato).
@@ -16,7 +17,7 @@ type AudioJob struct {
 type AudioProcessor interface {
 	// StartIsolation envía el archivo y devuelve un ID de trabajo asíncrono
 	StartIsolation(ctx context.Context, filePath string) (string, error)
-	
+
 	// CheckStatus revisa si la IA ya terminó de procesar ese ID
 	CheckStatus(ctx context.Context, jobID string) (*AudioJob, error)
 }
