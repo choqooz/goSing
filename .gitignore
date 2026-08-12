@@ -20,5 +20,10 @@ cookies.txt
 *.mp3
 *.wav
 
-# Gentle AI y configs locales (opcional ignorarlo, pero lo agregamos por seguridad)
+# Metadata local de herramientas
 .agents/
+/.atl/
+/.codegraph/
+
+# Script local ajeno al runtime de GoSing
+/quickstart.sh
