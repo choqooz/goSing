@@ -9,6 +9,7 @@ import (
 	"github.com/chocolate/gosing/frontend"
 	"github.com/chocolate/gosing/internal/adapters"
 	"github.com/chocolate/gosing/internal/handlers"
+	"github.com/chocolate/gosing/internal/observability"
 )
 
 func main() {
@@ -44,7 +45,7 @@ func main() {
 
 	port := ":8080"
 	log.Printf("🚀 Servidor levantado en http://localhost%s\n", port)
-	if err := http.ListenAndServe(port, mux); err != nil {
+	if err := http.ListenAndServe(port, observability.RequestIDMiddleware(mux)); err != nil {
 		log.Fatal(err)
 	}
 }

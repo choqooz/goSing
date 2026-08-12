@@ -17,6 +17,7 @@ import (
 
 	"github.com/chocolate/gosing/internal/adapters"
 	"github.com/chocolate/gosing/internal/core"
+	"github.com/chocolate/gosing/internal/observability"
 )
 
 type AudioHandler struct {
@@ -25,6 +26,8 @@ type AudioHandler struct {
 	runSearch     func(context.Context, string) ([]byte, error)
 	runDownload   func(context.Context, string, string) error
 	tempDir       string
+	logger        *observability.Logger
+	clock         func() time.Time
 }
 
 type SearchResult struct {
@@ -35,11 +38,17 @@ type SearchResult struct {
 }
 
 func NewAudioHandler(p core.AudioProcessor) *AudioHandler {
-	return &AudioHandler{processor: p, suggestClient: &http.Client{Timeout: suggestionTimeout}, runSearch: searchYouTube, runDownload: downloadAudio, tempDir: os.TempDir()}
+	return NewAudioHandlerWithLogger(p, observability.DefaultLogger(), time.Now)
+}
+
+func NewAudioHandlerWithLogger(p core.AudioProcessor, logger *observability.Logger, clock func() time.Time) *AudioHandler {
+	return &AudioHandler{processor: p, suggestClient: &http.Client{Timeout: suggestionTimeout}, runSearch: searchYouTube, runDownload: downloadAudio, tempDir: os.TempDir(), logger: logger, clock: clock}
 }
 
 // SuggestYouTube devuelve sugerencias de autocompletado ultra rápidas.
 func (h *AudioHandler) SuggestYouTube(w http.ResponseWriter, r *http.Request) {
+	w, finish := h.observe(w, r, "suggest")
+	defer finish()
 	query := r.URL.Query().Get("q")
 	if query == "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -75,6 +84,8 @@ func (h *AudioHandler) SuggestYouTube(w http.ResponseWriter, r *http.Request) {
 
 // SearchYouTube busca en YouTube usando yt-dlp.
 func (h *AudioHandler) SearchYouTube(w http.ResponseWriter, r *http.Request) {
+	w, finish := h.observe(w, r, "search")
+	defer finish()
 	query := r.URL.Query().Get("q")
 	if query == "" {
 		http.Error(w, "missing query parameter", http.StatusBadRequest)
@@ -129,6 +140,8 @@ func (h *AudioHandler) SearchYouTube(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/audio/upload
 func (h *AudioHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
+	w, finish := h.observe(w, r, "upload")
+	defer finish()
 	// 1. Limitar tamaño a 20MB (protege la memoria de tu VPS gratuito)
 	r.Body = http.MaxBytesReader(w, r.Body, maxAudioSize)
 	if err := r.ParseMultipartForm(maxAudioSize); err != nil {
@@ -180,6 +193,8 @@ func (h *AudioHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/audio/status?job_id=xxx
 func (h *AudioHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	w, finish := h.observe(w, r, "status")
+	defer finish()
 	jobID := r.URL.Query().Get("job_id")
 	if jobID == "" {
 		http.Error(w, "Falta el parámetro job_id", http.StatusBadRequest)
@@ -188,13 +203,17 @@ func (h *AudioHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 
 	job, err := h.processor.CheckStatus(r.Context(), jobID)
 	if err != nil {
+		if errors.Is(err, adapters.ErrWorkerRateLimited) {
+			http.Error(w, "Error consultando la IA", http.StatusTooManyRequests)
+			return
+		}
 		var workerErr *adapters.WorkerHTTPError
 		if errors.As(err, &workerErr) && workerErr.StatusCode == http.StatusNotFound {
 			http.Error(w, "Trabajo no encontrado", http.StatusNotFound)
 			return
 		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			http.Error(w, "Error consultando la IA", http.StatusGatewayTimeout)
+		if status := requestErrorStatus(err); status != http.StatusInternalServerError {
+			http.Error(w, "Error consultando la IA", status)
 			return
 		}
 		http.Error(w, "Error consultando la IA", http.StatusInternalServerError)
@@ -211,6 +230,8 @@ type DownloadRequest struct {
 
 // POST /api/audio/download
 func (h *AudioHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
+	w, finish := h.observe(w, r, "download")
+	defer finish()
 	var req DownloadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Cuerpo de petición inválido", http.StatusBadRequest)
@@ -270,14 +291,14 @@ func downloadAudio(ctx context.Context, videoID, outputPath string) error {
 		"-o", outputPath, "-v", "https://youtube.com/watch?v=" + videoID,
 	}
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = io.Discard
 	return cmd.Run()
 }
 
 func searchYouTube(ctx context.Context, query string) ([]byte, error) {
 	args := []string{fmt.Sprintf("ytsearch10:%s", query), "--dump-json", "--ignore-errors", "--no-warnings", "--flat-playlist", "-v"}
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = io.Discard
 	return cmd.Output()
 }
 
@@ -304,4 +325,55 @@ func writeWorkerError(w http.ResponseWriter, err error) {
 		return
 	}
 	http.Error(w, "Error iniciando la IA", requestErrorStatus(err))
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (h *AudioHandler) observe(w http.ResponseWriter, r *http.Request, operation string) (http.ResponseWriter, func()) {
+	start, recorder := h.clock(), &statusWriter{ResponseWriter: w}
+	return recorder, func() {
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		event := observability.Event{Level: "info", Component: "handler", Event: "handler." + operation, RequestID: observability.RequestID(r.Context()), Operation: operation, Outcome: "success", DurationMS: h.clock().Sub(start).Milliseconds(), StatusCode: status}
+		if status >= http.StatusBadRequest {
+			event.Level, event.Outcome, event.ErrorCode = "error", "failure", errorCodeForStatus(status)
+		}
+		h.logger.Log(event)
+	}
+}
+
+func errorCodeForStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request"
+	case http.StatusRequestTimeout:
+		return "canceled"
+	case http.StatusTooManyRequests:
+		return "capacity_full"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusBadGateway:
+		return "upstream_unavailable"
+	case http.StatusGatewayTimeout:
+		return "timeout"
+	default:
+		return "unknown"
+	}
 }

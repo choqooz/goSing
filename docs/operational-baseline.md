@@ -64,6 +64,14 @@ The Go request deadlines are 5 seconds for suggestions, 20 seconds for search, 5
 
 FastAPI `BackgroundTasks` starts best-effort in-process work after the response. It is not a durable queue and has no cancellation endpoint: a worker restart marks inherited processing work as failed/interrupted before accepting new jobs.
 
+## Structured Observability
+
+Go emits one final JSON-line event for each handler (`suggest`, `search`, `download`, `upload`, `status`) and worker-adapter (`start`, `status`) operation. The fixed schema is `timestamp` (RFC3339 UTC), `level`, `component`, `event`, `request_id`, `job_id`, `operation`, `outcome`, `status`, `duration_ms`, `status_code`, `size_bytes`, and `error_code`; no arbitrary fields are accepted. `X-Request-ID` accepts one 1-64 character `[A-Za-z0-9._~-]` value or is replaced with a cryptographic UUID v4 and propagated to the worker.
+
+The worker emits `accepted`, `rejected`, `completed`, `failed`, `expired`, `interrupted`, and `cleanup_error` events. It persists the request ID only in job metadata so background work remains correlated; public job-status responses omit it. Worker upload responses, including capacity rejection, return `X-Request-ID` without changing their JSON bodies.
+
+Logs never include queries, titles, filenames, paths, full URLs, cookies, stderr, raw errors, or stacks. This baseline intentionally exposes no `/metrics` endpoint.
+
 ## Scope and Reproducibility Risk
 
 The Go backend embeds `frontend/dist`, eliminating the split between development and production UI sources. The worker resolves `separated/` from `worker/main.py`, and its ASGI process is started by Uvicorn from `worker/`.

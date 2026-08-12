@@ -11,9 +11,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chocolate/gosing/internal/adapters"
 	"github.com/chocolate/gosing/internal/core"
+	"github.com/chocolate/gosing/internal/observability"
 )
 
 type recordingProcessor struct {
@@ -246,6 +248,37 @@ func TestHandleDownload(t *testing.T) {
 				if _, err := os.Stat(filepath.Dir(output)); !os.IsNotExist(err) {
 					t.Fatalf("temporary download directory remains: %q, err=%v", filepath.Dir(output), err)
 				}
+			}
+		})
+	}
+}
+
+func TestHandlerObservabilityIsSanitizedAndClassified(t *testing.T) {
+	for _, tt := range []struct {
+		name, operation, request, wantError string
+		wantCode                            int
+		processor                           *recordingProcessor
+	}{
+		{"upload capacity", "upload", "song private.mp3", "capacity_full", http.StatusTooManyRequests, &recordingProcessor{err: adapters.ErrWorkerRateLimited}},
+		{"status timeout", "status", "job-1?secret", "timeout", http.StatusGatewayTimeout, &recordingProcessor{statusErr: context.DeadlineExceeded}},
+		{"status canceled", "status", "job-1?secret", "canceled", http.StatusRequestTimeout, &recordingProcessor{statusErr: context.Canceled}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs strings.Builder
+			now := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
+			h := NewAudioHandlerWithLogger(tt.processor, observability.NewLogger(&logs), func() time.Time { return now })
+			h.tempDir = t.TempDir()
+			rec := httptest.NewRecorder()
+			if tt.operation == "upload" {
+				h.HandleUpload(rec, uploadRequest(t, tt.request, strings.NewReader("audio")))
+			} else {
+				h.HandleStatus(rec, httptest.NewRequest(http.MethodGet, "/api/audio/status?job_id="+tt.request, nil))
+			}
+			if rec.Code != tt.wantCode || !strings.Contains(logs.String(), `"error_code":"`+tt.wantError+`"`) {
+				t.Fatalf("status/log = %d/%q", rec.Code, logs.String())
+			}
+			if strings.Contains(logs.String(), "private") || strings.Contains(logs.String(), "secret") || strings.Contains(logs.String(), "song ") {
+				t.Fatalf("sensitive input leaked: %q", logs.String())
 			}
 		})
 	}
