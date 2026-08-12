@@ -11,6 +11,10 @@ from unittest.mock import patch
 import main
 
 
+def request(request_id=None):
+    return type("Request", (), {"headers": {} if request_id is None else {"X-Request-ID": request_id}})()
+
+
 class WorkerHealthTests(unittest.TestCase):
     def test_health_reports_ok(self):
         self.assertEqual(asyncio.run(main.health()), {"status": "ok"})
@@ -62,24 +66,25 @@ class WorkerLifecycleTests(unittest.TestCase):
         self.root = Path(self.tempdir.name) / "separated"
         self.jobs_dir = self.root / "jobs"
         self.jobs_dir.mkdir(parents=True)
-        self.previous = (main.SEPARATED_DIR, main.JOBS_DIR, main.jobs, main.clock, main.command_runner)
+        self.previous = (main.SEPARATED_DIR, main.JOBS_DIR, main.jobs, main.clock, main.command_runner, main.event_writer)
         main.SEPARATED_DIR = self.root
         main.JOBS_DIR = self.jobs_dir
         main.jobs = {}
         main.clock = lambda: self.now
+        main.event_writer = io.StringIO()
 
     def tearDown(self):
-        main.SEPARATED_DIR, main.JOBS_DIR, main.jobs, main.clock, main.command_runner = self.previous
+        main.SEPARATED_DIR, main.JOBS_DIR, main.jobs, main.clock, main.command_runner, main.event_writer = self.previous
         self.tempdir.cleanup()
 
-    def upload(self, filename="song.mp3", content=b"audio"):
+    def upload(self, filename="song.mp3", content=b"audio", request_id=None):
         tasks = Tasks()
-        response = asyncio.run(main.process_audio(Upload(filename, content), tasks))
+        response = asyncio.run(main.process_audio(request(request_id), Upload(filename, content), tasks))
         return json.loads(response.body)["job_id"], tasks
 
-    def process(self, filename="song.mp3", content=b"audio"):
+    def process(self, filename="song.mp3", content=b"audio", request_id=None):
         tasks = Tasks()
-        return asyncio.run(main.process_audio(Upload(filename, content), tasks)), tasks
+        return asyncio.run(main.process_audio(request(request_id), Upload(filename, content), tasks)), tasks
 
     def workspace(self, status="completed", expires_at=None):
         job_id = str(uuid.uuid4())
@@ -91,6 +96,9 @@ class WorkerLifecycleTests(unittest.TestCase):
         main.save_metadata(workspace, metadata)
         main.jobs[job_id] = metadata
         return job_id, workspace, metadata
+
+    def events(self):
+        return [json.loads(line) for line in main.event_writer.getvalue().splitlines()]
 
     def test_upload_is_chunked_and_rejects_more_than_20_mib(self):
         job_id, tasks = self.upload(content=b"a" * (main.UPLOAD_CHUNK_BYTES + 1))
@@ -307,6 +315,75 @@ class WorkerLifecycleTests(unittest.TestCase):
         main.save_metadata(workspace, metadata)
         self.assertEqual(main.load_metadata(workspace)["error"], "saved")
         self.assertFalse((workspace / "metadata.tmp").exists())
+
+    def test_event_is_one_line_allowlisted_and_normalizes_duration(self):
+        main.emit_event(writer=main.event_writer, event="worker.accepted", duration_ms=-1, forbidden="no")
+
+        payload = self.events()[0]
+        self.assertEqual(set(payload), set(main.EVENT_FIELDS) & set(payload))
+        self.assertEqual(payload["duration_ms"], 0)
+        self.assertTrue(payload["timestamp"].endswith("Z"))
+
+    def test_request_id_propagates_to_response_metadata_and_completion(self):
+        request_id = "request-42"
+        response, _ = self.process(request_id=request_id)
+        job_id = json.loads(response.body)["job_id"]
+
+        def successful_demucs(command, **_kwargs):
+            output = Path(command[command.index("--out") + 1]) / "htdemucs" / "input"
+            output.mkdir(parents=True)
+            (output / "vocals.mp3").write_bytes(b"vocals")
+            (output / "no_vocals.mp3").write_bytes(b"instrumental")
+
+        main.command_runner = successful_demucs
+        main.run_demucs(job_id)
+        self.assertEqual(response.headers["x-request-id"], request_id)
+        self.assertEqual(main.jobs[job_id]["request_id"], request_id)
+        self.assertEqual({event["request_id"] for event in self.events() if event.get("job_id") == job_id}, {request_id})
+        self.assertNotIn("request_id", main.public_job(main.jobs[job_id]))
+
+    def test_missing_or_invalid_request_ids_are_generated(self):
+        for value in (None, "invalid request id"):
+            response, _ = self.process(request_id=value)
+            self.assertRegex(response.headers["x-request-id"], r"^[0-9a-f-]{36}$")
+            main.jobs.clear()
+
+    def test_rejections_emit_sanitized_events_and_keep_capacity_body(self):
+        self.upload(request_id="first")
+        response, tasks = self.process(request_id="capacity")
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["x-request-id"], "capacity")
+        self.assertEqual(tasks.tasks, [])
+        self.assertEqual(len(list(self.jobs_dir.iterdir())), 1)
+        with self.assertRaises(main.HTTPException):
+            self.process("secret-name.txt", request_id="format")
+        main.jobs.clear()
+        with self.assertRaises(main.HTTPException):
+            self.process(content=b"a" * (main.MAX_UPLOAD_BYTES + 1), request_id="large")
+        self.assertEqual({event["error_code"] for event in self.events() if event["event"] == "worker.rejected"}, {"capacity_full", "unsupported_format", "payload_too_large"})
+
+    def test_terminal_events_and_failures_do_not_leak_sensitive_values(self):
+        corrupt = self.jobs_dir / str(uuid.uuid4())
+        corrupt.mkdir()
+        (corrupt / "metadata.json").write_text("invalid", encoding="utf-8")
+        job_id, workspace, metadata = self.workspace("completed", self.now)
+        metadata["request_id"] = "cleanup"
+        main.save_metadata(workspace, metadata)
+        main.cleanup_expired()
+        interrupted, _, metadata = self.workspace("processing")
+        metadata["request_id"] = "restart"
+        main.save_metadata(main.workspace_for(interrupted), metadata)
+        main.jobs = {}
+        main.load_jobs()
+        failed, _ = self.upload("secret-name.mp3", request_id="failure")
+        main.command_runner = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("/secret/path?query=token cookie stderr stack"))
+        main.run_demucs(failed)
+        emitted = main.event_writer.getvalue()
+        self.assertEqual(main.jobs[failed]["error"], "Audio separation failed.")
+        self.assertEqual(main.public_job(main.jobs[failed])["error"], "Audio separation failed.")
+        self.assertTrue({"worker.expired", "worker.interrupted", "worker.failed", "worker.cleanup_error"} <= {event["event"] for event in self.events()})
+        for forbidden in ("secret-name", "/secret/path", "query=", "cookie", "stderr", "stack"):
+            self.assertNotIn(forbidden, emitted)
 
 
 if __name__ == "__main__":

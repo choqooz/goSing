@@ -1,14 +1,16 @@
 import json
-import logging
 import os
+import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -23,18 +25,32 @@ TTL_SECONDS = 24 * 60 * 60
 MAX_PROCESSING_JOBS = 1
 RETRY_AFTER_SECONDS = 60
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
+EVENT_FIELDS = {"timestamp", "level", "component", "event", "request_id", "job_id", "operation", "outcome", "status", "duration_ms", "status_code", "size_bytes", "error_code"}
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._~-]{1,64}$")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 jobs = {}
 jobs_lock = threading.RLock()
 clock = time.time
 command_runner = subprocess.run
+event_writer = sys.stdout
+event_clock = lambda: datetime.now(timezone.utc)
 
 # StaticFiles requires this output directory at application construction time.
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI()
 app.mount("/audio", StaticFiles(directory=SEPARATED_DIR), name="audio")
+
+
+def emit_event(writer=None, **fields):
+    event = {key: value for key, value in fields.items() if key in EVENT_FIELDS and value is not None}
+    event["timestamp"] = event_clock().astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    event["duration_ms"] = max(0, int(event.get("duration_ms", 0)))
+    (writer or event_writer).write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
+def request_id_for(request):
+    value = request.headers.get("X-Request-ID", "") if request is not None else ""
+    return value if REQUEST_ID_PATTERN.fullmatch(value) else str(uuid.uuid4())
 
 
 def readiness_checks():
@@ -92,8 +108,8 @@ def load_metadata(workspace):
         ):
             raise ValueError("invalid job metadata")
         return metadata
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        logger.warning("Ignoring corrupt job metadata in %s: %s", workspace.name, error)
+    except (OSError, ValueError, json.JSONDecodeError):
+        emit_event(level="error", component="worker", event="worker.cleanup_error", operation="cleanup", outcome="failure", error_code="storage_failed")
         return None
 
 
@@ -123,7 +139,6 @@ def capacity_available():
 
 
 def rate_limit_response():
-    logger.info("Rejecting audio job: processing capacity is full")
     return JSONResponse(
         status_code=429,
         content={
@@ -134,7 +149,7 @@ def rate_limit_response():
     )
 
 
-def fail_job(job_id, message):
+def fail_job(job_id, message, error_code="unknown"):
     workspace = workspace_for(job_id)
     metadata = jobs.get(job_id)
     if workspace is None or metadata is None:
@@ -145,25 +160,25 @@ def fail_job(job_id, message):
     try:
         remove_runtime_files(workspace)
     except Exception:
-        logger.warning("Could not remove failed job runtime files")
+        emit_event(level="error", component="worker", event="worker.cleanup_error", request_id=metadata.get("request_id"), job_id=job_id, operation="cleanup", outcome="failure", error_code="cleanup_failed")
     try:
         save_metadata(workspace, metadata)
     except Exception:
-        logger.warning("Could not persist failed job metadata")
-    logger.info("Demucs job %s failed", job_id)
+        emit_event(level="error", component="worker", event="worker.cleanup_error", request_id=metadata.get("request_id"), job_id=job_id, operation="metadata", outcome="failure", error_code="storage_failed")
+    emit_event(level="error", component="worker", event="worker.failed", request_id=metadata.get("request_id"), job_id=job_id, operation="demucs", outcome="failure", status="failed", error_code=error_code)
 
 
 def cleanup_expired():
     with jobs_lock:
         try:
             workspaces = list(JOBS_DIR.iterdir())
-        except OSError as error:
-            logger.warning("Could not inspect job directory: %s", error)
+        except OSError:
+            emit_event(level="error", component="worker", event="worker.cleanup_error", operation="cleanup", outcome="failure", error_code="storage_failed")
             return
         now = clock()
         for workspace in workspaces:
             if workspace_for(workspace.name) != workspace or workspace.is_symlink():
-                logger.warning("Ignoring unsafe job workspace: %s", workspace)
+                emit_event(level="error", component="worker", event="worker.cleanup_error", operation="cleanup", outcome="failure", error_code="cleanup_failed")
                 continue
             metadata = load_metadata(workspace)
             if metadata is None:
@@ -175,8 +190,9 @@ def cleanup_expired():
             try:
                 shutil.rmtree(workspace)
                 jobs.pop(workspace.name, None)
-            except OSError as error:
-                logger.warning("Could not remove expired job %s: %s", workspace.name, error)
+                emit_event(level="info", component="worker", event="worker.expired", request_id=metadata.get("request_id"), job_id=workspace.name, operation="cleanup", outcome="success", status="expired")
+            except OSError:
+                emit_event(level="error", component="worker", event="worker.cleanup_error", request_id=metadata.get("request_id"), job_id=workspace.name, operation="cleanup", outcome="failure", error_code="cleanup_failed")
 
 
 def load_jobs():
@@ -184,18 +200,21 @@ def load_jobs():
         cleanup_expired()
         try:
             workspaces = list(JOBS_DIR.iterdir())
-        except OSError as error:
-            logger.warning("Could not load jobs: %s", error)
+        except OSError:
+            emit_event(level="error", component="worker", event="worker.cleanup_error", operation="load", outcome="failure", error_code="storage_failed")
             return
         for workspace in workspaces:
             if workspace_for(workspace.name) != workspace or workspace.is_symlink():
-                logger.warning("Ignoring unsafe job workspace: %s", workspace)
+                emit_event(level="error", component="worker", event="worker.cleanup_error", operation="load", outcome="failure", error_code="cleanup_failed")
                 continue
             metadata = load_metadata(workspace)
             if metadata is None:
                 continue
             if metadata.get("status") == "processing":
-                remove_runtime_files(workspace)
+                try:
+                    remove_runtime_files(workspace)
+                except Exception:
+                    emit_event(level="error", component="worker", event="worker.cleanup_error", request_id=metadata.get("request_id"), job_id=workspace.name, operation="cleanup", outcome="failure", error_code="cleanup_failed")
                 metadata.update(
                     status="failed",
                     error="Processing interrupted by worker restart.",
@@ -204,7 +223,8 @@ def load_jobs():
                 try:
                     save_metadata(workspace, metadata)
                 except Exception:
-                    logger.warning("Could not persist interrupted job metadata")
+                    emit_event(level="error", component="worker", event="worker.cleanup_error", request_id=metadata.get("request_id"), job_id=workspace.name, operation="metadata", outcome="failure", error_code="storage_failed")
+                emit_event(level="error", component="worker", event="worker.interrupted", request_id=metadata.get("request_id"), job_id=workspace.name, operation="recovery", outcome="failure", status="failed", error_code="job_interrupted")
             jobs[workspace.name] = metadata
         cleanup_expired()
 
@@ -263,18 +283,18 @@ def run_demucs(job_id):
             try:
                 save_metadata(workspace, metadata)
             except Exception:
-                logger.warning("Could not persist completed job metadata")
-            logger.info("Demucs job %s completed", job_id)
+                emit_event(level="error", component="worker", event="worker.cleanup_error", request_id=metadata.get("request_id"), job_id=job_id, operation="metadata", outcome="failure", error_code="storage_failed")
+            emit_event(level="info", component="worker", event="worker.completed", request_id=metadata.get("request_id"), job_id=job_id, operation="demucs", outcome="success", status="completed")
     except Exception:
         with jobs_lock:
-            fail_job(job_id, "Audio separation failed.")
+            fail_job(job_id, "Audio separation failed.", "command_failed")
     finally:
         with jobs_lock:
             if workspace is not None:
                 try:
                     input_path.unlink(missing_ok=True)
                 except OSError:
-                    logger.warning("Could not remove completed job input")
+                    emit_event(level="error", component="worker", event="worker.cleanup_error", request_id=metadata.get("request_id") if metadata else None, job_id=job_id, operation="cleanup", outcome="failure", error_code="cleanup_failed")
 
 
 @app.get("/health")
@@ -291,26 +311,31 @@ async def ready():
 
 
 @app.post("/api/process")
-async def process_audio(file: UploadFile, background_tasks: BackgroundTasks):
+async def process_audio(request: Request, file: UploadFile, background_tasks: BackgroundTasks):
     cleanup_expired()
+    request_id = request_id_for(request)
     extension = Path(file.filename or "").suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Unsupported audio format.")
+        emit_event(level="error", component="worker", event="worker.rejected", request_id=request_id, operation="upload", outcome="failure", status_code=400, error_code="unsupported_format")
+        raise HTTPException(status_code=400, detail="Unsupported audio format.", headers={"X-Request-ID": request_id})
     job_id = str(uuid.uuid4())
     workspace = workspace_for(job_id)
     input_name = f"input{extension}"
     input_path = workspace / input_name
     metadata = {
         "id": job_id,
+        "request_id": request_id,
         "status": "processing",
         "created_at": clock(),
-        "original_filename": file.filename,
         "input_name": input_name,
     }
     try:
         with jobs_lock:
             if not capacity_available():
-                return rate_limit_response()
+                emit_event(level="error", component="worker", event="worker.rejected", request_id=request_id, operation="upload", outcome="failure", status_code=429, error_code="capacity_full")
+                response = rate_limit_response()
+                response.headers["X-Request-ID"] = request_id
+                return response
             workspace.mkdir()
             jobs[job_id] = metadata
             save_metadata(workspace, metadata)
@@ -319,7 +344,8 @@ async def process_audio(file: UploadFile, background_tasks: BackgroundTasks):
             while chunk := await file.read(UPLOAD_CHUNK_BYTES):
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Upload exceeds 20 MiB limit.")
+                    emit_event(level="error", component="worker", event="worker.rejected", request_id=request_id, job_id=job_id, operation="upload", outcome="failure", status_code=413, size_bytes=size, error_code="payload_too_large")
+                    raise HTTPException(status_code=413, detail="Upload exceeds 20 MiB limit.", headers={"X-Request-ID": request_id})
                 buffer.write(chunk)
     except Exception:
         with jobs_lock:
@@ -327,7 +353,8 @@ async def process_audio(file: UploadFile, background_tasks: BackgroundTasks):
             remove_path(workspace)
         raise
     background_tasks.add_task(run_demucs, job_id)
-    return JSONResponse(content={"job_id": job_id})
+    emit_event(level="info", component="worker", event="worker.accepted", request_id=request_id, job_id=job_id, operation="upload", outcome="success", status="processing", status_code=200, size_bytes=size)
+    return JSONResponse(content={"job_id": job_id}, headers={"X-Request-ID": request_id})
 
 
 @app.get("/api/status/{job_id}")
