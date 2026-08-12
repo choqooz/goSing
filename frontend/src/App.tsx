@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Upload, Music, Play, Pause, SkipBack, SkipForward, Repeat, Mic2, FileAudio, Search, Loader2 } from "lucide-react";
+import { Upload, Play, Pause, SkipBack, SkipForward, Repeat, Search, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Slider } from "@/components/ui/slider";
@@ -103,7 +103,7 @@ export default function App() {
         if (Array.isArray(data) && data.length > 1 && Array.isArray(data[1])) {
           setSuggestions(data[1].slice(0, 5));
         }
-      } catch (err) {}
+      } catch {}
     }, 300);
     return () => clearTimeout(timer);
   }, [searchQuery]);
@@ -126,7 +126,7 @@ export default function App() {
     setIsSearching(false);
   };
 
-  const handleDownload = async (videoId: string, title: string, thumb: string, author: string) => {
+  const handleDownload = async (videoId: string, title: string, thumb: string) => {
     setStatus("uploading");
     setError("");
     setLyrics([]);
@@ -214,7 +214,7 @@ export default function App() {
       } else {
         setLyrics([{ time: 0, text: "Letra no encontrada en LRCLIB." }]);
       }
-    } catch (e) {
+    } catch {
       setLyrics([{ time: 0, text: "Letra no encontrada en LRCLIB." }]);
     }
   };
@@ -361,7 +361,7 @@ export default function App() {
                       return (
                         <div 
                           key={result.videoId} 
-                          onClick={() => handleDownload(result.videoId, result.title, result.thumb || "", result.author || "")}
+                          onClick={() => handleDownload(result.videoId, result.title, result.thumb || "")}
                           className="flex gap-4 p-4 bg-white/5 hover:bg-white/10 border border-white/5 hover:border-white/10 rounded-2xl cursor-pointer active:scale-[0.96] transition items-center backdrop-blur-sm"
                         >
                           <img src={result.thumb || ""} alt={result.title} className="w-16 h-12 object-cover rounded-md outline outline-1 outline-white/10" />
@@ -528,7 +528,7 @@ export default function App() {
                   value={[currentTime]}
                   max={duration || 100}
                   step={1}
-                  onValueChange={(val) => {
+                  onValueChange={(val: number[]) => {
                     if (instrumentalRef.current && vocalRef.current) {
                       instrumentalRef.current.currentTime = val[0];
                       vocalRef.current.currentTime = val[0];
@@ -567,7 +567,7 @@ export default function App() {
                   </div>
                   <Slider 
                     value={vocalVolume} 
-                    onValueChange={(val) => setVocalVolume(Array.isArray(val) ? val : [val])} 
+                    onValueChange={(val: number[]) => setVocalVolume(val)}
                     max={100} 
                     step={1}
                     className="w-32"
@@ -652,7 +652,7 @@ export default function App() {
                             return (
                               <div 
                                 key={result.videoId} 
-                                onClick={() => handleDownload(result.videoId, result.title, result.thumb || "", result.author || "")}
+                                onClick={() => handleDownload(result.videoId, result.title, result.thumb || "")}
                                 className="flex gap-4 p-4 bg-white/5 hover:bg-white/10 border-0 ring-1 ring-white/5 hover:ring-white/10 rounded-2xl cursor-pointer active:scale-[0.96] transition items-center backdrop-blur-sm"
                               >
                                 <img src={result.thumb || ""} alt={result.title} className="w-16 h-12 object-cover rounded-md outline outline-1 outline-white/10" />

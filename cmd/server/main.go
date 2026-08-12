@@ -6,13 +6,13 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/chocolate/gosing/frontend"
 	"github.com/chocolate/gosing/internal/adapters"
 	"github.com/chocolate/gosing/internal/handlers"
-	"github.com/chocolate/gosing/ui"
 )
 
 func main() {
-	distFS, err := fs.Sub(ui.Files, "dist")
+	distFS, err := fs.Sub(frontend.Files, "dist")
 	if err != nil {
 		log.Fatal("Error cargando frontend: ", err)
 	}
@@ -21,7 +21,7 @@ func main() {
 	// 1. Instanciamos los Adaptadores (los conectores al mundo exterior)
 	// Ya no usamos el Mock. Usamos el cliente HTTP real apuntando a Python.
 	demucsClient := adapters.NewDemucsAdapter("http://127.0.0.1:8000")
-	
+
 	// 2. Instanciamos los Handlers inyectándole el adaptador real
 	// El handler ni se entera de que cambiamos el adaptador, ¡cumple el mismo contrato!
 	audioHandler := handlers.NewAudioHandler(demucsClient)
@@ -30,10 +30,7 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Healthcheck
-	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status": "ok", "message": "API corriendo"}`)
-	})
+	mux.HandleFunc("GET /api/health", healthHandler)
 
 	// Endpoints de Audio
 	mux.HandleFunc("/api/audio/search", audioHandler.SearchYouTube)
@@ -50,4 +47,9 @@ func main() {
 	if err := http.ListenAndServe(port, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status": "ok", "message": "API corriendo"}`)
 }
