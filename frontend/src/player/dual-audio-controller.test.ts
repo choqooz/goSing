@@ -19,6 +19,7 @@ function createCallbacks() {
     onDurationChange: vi.fn(),
     onIsPlayingChange: vi.fn(),
     onMasterTimeUpdate: vi.fn(),
+    onPlaybackError: vi.fn(),
   };
   return callbacks;
 }
@@ -59,6 +60,7 @@ describe("dual audio controller", () => {
     expect(instrumental.pause).toHaveBeenCalledOnce();
     expect(vocal.pause).toHaveBeenCalledOnce();
     expect(callbacks.onIsPlayingChange).toHaveBeenCalledWith(false);
+    expect(callbacks.onPlaybackError).toHaveBeenCalledOnce();
   });
 
   it("pauses both tracks", () => {

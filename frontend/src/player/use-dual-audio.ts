@@ -20,6 +20,7 @@ export function useDualAudio({ onMasterTimeUpdate, sourceKey, trackMasterTime }:
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [playbackError, setPlaybackError] = useState("");
   const [vocalVolume, setVocalVolumeState] = useState([50]);
 
   onMasterTimeUpdateRef.current = onMasterTimeUpdate;
@@ -30,6 +31,7 @@ export function useDualAudio({ onMasterTimeUpdate, sourceKey, trackMasterTime }:
     onIsPlayingChange: setIsPlaying,
     onMasterTimeUpdate: (time) => onMasterTimeUpdateRef.current(time),
     onCurrentTimeChange: setCurrentTime,
+    onPlaybackError: () => setPlaybackError("No se pudo iniciar la reproducción."),
     shouldUpdateMasterTime: () => trackMasterTimeRef.current,
   };
 
@@ -44,7 +46,9 @@ export function useDualAudio({ onMasterTimeUpdate, sourceKey, trackMasterTime }:
   const togglePlay = async () => {
     const controller = getController();
     if (!controller) return;
-    await controller.toggle();
+    const started = await controller.toggle();
+    if (started) setPlaybackError("");
+    return started;
   };
 
   const seek = (time: number) => getController()?.seek(time);
@@ -69,6 +73,7 @@ export function useDualAudio({ onMasterTimeUpdate, sourceKey, trackMasterTime }:
     setCurrentTime(0);
     setDuration(0);
     setIsPlaying(false);
+    setPlaybackError("");
     return () => {
       controllerRef.current?.dispose();
       controllerRef.current = null;
@@ -83,6 +88,7 @@ export function useDualAudio({ onMasterTimeUpdate, sourceKey, trackMasterTime }:
     handleMasterTimeUpdate,
     instrumentalRef,
     isPlaying,
+    playbackError,
     seek,
     setVocalVolume,
     togglePlay,

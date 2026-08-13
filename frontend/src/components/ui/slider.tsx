@@ -29,12 +29,12 @@ export function Slider({
         step={step}
         value={val}
         onChange={(e) => onValueChange?.([parseFloat(e.target.value)])}
-        className="absolute w-full h-full opacity-0 cursor-pointer z-10"
+        className="peer absolute w-full h-full opacity-0 cursor-pointer z-10 focus-visible:outline-none"
         {...props}
       />
       {/* Thumb visual (pointer events none so input underneath catches events) */}
       <div 
-        className="absolute w-4 h-4 bg-white rounded-full shadow-[0_2px_8px_rgba(0,0,0,0.5)] pointer-events-none z-0"
+        className="absolute w-4 h-4 bg-white rounded-full shadow-[0_2px_8px_rgba(0,0,0,0.5)] pointer-events-none z-0 peer-focus-visible:ring-2 peer-focus-visible:ring-white/50"
         style={{ left: `calc(${percentage}% - 8px)` }}
       />
     </div>

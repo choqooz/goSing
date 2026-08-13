@@ -11,6 +11,7 @@ export interface DualAudioCallbacks {
   onIsPlayingChange: (isPlaying: boolean) => void;
   onMasterTimeUpdate: (time: number) => void;
   onCurrentTimeChange: (time: number) => void;
+  onPlaybackError?: () => void;
   shouldUpdateMasterTime?: () => boolean;
 }
 
@@ -64,6 +65,7 @@ export function createDualAudioController(
         instrumental.pause();
         vocal.pause();
         publishPlaying(false);
+        callbacks.onPlaybackError?.();
         return false;
       }
 
