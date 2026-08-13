@@ -12,6 +12,11 @@ import { LyricsList } from "@/components/lyrics-list";
 import { PlayerControls } from "@/components/player-controls";
 import { scrollBehavior } from "@/lib/motion";
 
+interface IngressTask {
+  controller: AbortController;
+  generation: number;
+}
+
 export default function App() {
   const reduceMotion = useReducedMotion();
   const [file, setFile] = useState<File | null>(null);
@@ -25,6 +30,25 @@ export default function App() {
   
   const [showAlert, setShowAlert] = useState(false);
   const [alertTriggered, setAlertTriggered] = useState(false);
+  const ingressTaskRef = useRef<IngressTask | null>(null);
+
+  const startIngressTask = () => {
+    const previousTask = ingressTaskRef.current;
+    previousTask?.controller.abort();
+    const task = {
+      controller: new AbortController(),
+      generation: (previousTask?.generation ?? 0) + 1,
+    };
+    ingressTaskRef.current = task;
+    setJobId(null);
+    return task;
+  };
+
+  const isLatestIngressTask = (task: IngressTask) => ingressTaskRef.current?.generation === task.generation;
+
+  useEffect(() => () => {
+    ingressTaskRef.current?.controller.abort();
+  }, []);
 
   const getTrackInfo = () => {
     if (trackMeta) return trackMeta;
@@ -45,6 +69,7 @@ export default function App() {
 
   const handleUpload = async () => {
     if (!file) return;
+    const task = startIngressTask();
     setStatus("uploading");
     setError("");
     setLyrics([]);
@@ -59,18 +84,22 @@ export default function App() {
       const res = await fetch("/api/audio/upload", {
         method: "POST",
         body: formData,
+        signal: task.controller.signal,
       });
       if (!res.ok) throw new Error("Error en la subida");
       const data = await res.json();
+      if (!isLatestIngressTask(task)) return;
       setJobId(data.job_id);
       setStatus("processing");
     } catch (err: any) {
+      if (!isLatestIngressTask(task) || task.controller.signal.aborted) return;
       setError(err.message);
       setStatus("idle");
     }
   };
 
   const handleDownload = async (videoId: string, title: string, thumb: string) => {
+    const task = startIngressTask();
     setStatus("uploading");
     setError("");
     setLyrics([]);
@@ -92,12 +121,15 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ videoId }),
+        signal: task.controller.signal,
       });
       if (!res.ok) throw new Error("Error en la descarga");
       const data = await res.json();
+      if (!isLatestIngressTask(task)) return;
       setJobId(data.job_id);
       setStatus("processing");
     } catch (err: any) {
+      if (!isLatestIngressTask(task) || task.controller.signal.aborted) return;
       setError(err.message);
       setStatus("idle");
     }
