@@ -6,6 +6,7 @@ import { Slider } from "@/components/ui/slider";
 import { Progress } from "@/components/ui/progress";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
+import { useDualAudio } from "@/player/use-dual-audio";
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
@@ -23,10 +24,6 @@ export default function App() {
   const [instrumentalUrl, setInstrumentalUrl] = useState("");
   const [vocalUrl, setVocalUrl] = useState("");
   
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [vocalVolume, setVocalVolume] = useState([50]);
-  const [duration, setDuration] = useState(0);
-  const [currentTime, setCurrentTime] = useState(0);
   const [showAlert, setShowAlert] = useState(false);
   const [alertTriggered, setAlertTriggered] = useState(false);
 
@@ -42,9 +39,6 @@ export default function App() {
   };
   const { artist, title, thumb } = getTrackInfo();
   
-  const instrumentalRef = useRef<HTMLAudioElement>(null);
-  const vocalRef = useRef<HTMLAudioElement>(null);
-
   const formatTime = (secs: number) => {
     if (!secs || isNaN(secs)) return "00:00";
     const m = Math.floor(secs / 60);
@@ -244,28 +238,8 @@ export default function App() {
     }
   }, [status, jobId, file]);
 
-  const togglePlay = () => {
-    if (!instrumentalRef.current || !vocalRef.current) return;
-    if (isPlaying) {
-      instrumentalRef.current.pause();
-      vocalRef.current.pause();
-    } else {
-      instrumentalRef.current.play();
-      vocalRef.current.play();
-    }
-    setIsPlaying(!isPlaying);
-  };
-
-  useEffect(() => {
-    if (vocalRef.current) {
-      vocalRef.current.volume = vocalVolume[0] / 100;
-    }
-  }, [vocalVolume]);
-
-  const handleTimeUpdate = () => {
-    if (!instrumentalRef.current || lyrics.length === 0) return;
-    const currentT = instrumentalRef.current.currentTime;
-    setCurrentTime(currentT);
+  const handleMasterTimeUpdate = (currentT: number) => {
+    if (lyrics.length === 0) return;
     
     if (duration > 0 && duration - currentT <= 60 && !alertTriggered) {
       setShowAlert(true);
@@ -291,6 +265,25 @@ export default function App() {
       }
     }
   };
+
+  const {
+    currentTime,
+    duration,
+    handleMasterEnded,
+    handleMasterLoadedMetadata,
+    handleMasterTimeUpdate: updateMasterTime,
+    instrumentalRef,
+    isPlaying,
+    seek,
+    setVocalVolume,
+    togglePlay,
+    vocalRef,
+    vocalVolume,
+  } = useDualAudio({
+    onMasterTimeUpdate: handleMasterTimeUpdate,
+    sourceKey: `${instrumentalUrl}\u0000${vocalUrl}`,
+    trackMasterTime: lyrics.length > 0,
+  });
 
   return (
     <div className="h-screen w-full bg-black text-white flex overflow-hidden font-sans relative antialiased">
@@ -497,8 +490,7 @@ export default function App() {
                          }`}
                          onClick={() => {
                            if (instrumentalRef.current && vocalRef.current) {
-                             instrumentalRef.current.currentTime = line.time;
-                             vocalRef.current.currentTime = line.time;
+                             seek(line.time);
                              if (!isPlaying) togglePlay();
                            }
                          }}
@@ -514,11 +506,11 @@ export default function App() {
             {/* Playback Controls */}
             <div className="flex flex-col gap-6 bg-white/[0.04] backdrop-blur-2xl saturate-[180%] border border-white/10 p-8 rounded-[2rem] shadow-[inset_0_1px_0_rgba(255,255,255,0.1),0_12px_40px_rgba(0,0,0,0.5)] shrink-0">
               <audio 
-                ref={instrumentalRef} 
-                src={instrumentalUrl} 
-                onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
-                onTimeUpdate={handleTimeUpdate} 
-                onEnded={() => setIsPlaying(false)} 
+                ref={instrumentalRef}
+                src={instrumentalUrl}
+                onLoadedMetadata={handleMasterLoadedMetadata}
+                onTimeUpdate={updateMasterTime}
+                onEnded={handleMasterEnded}
               />
               <audio ref={vocalRef} src={vocalUrl} />
 
@@ -530,9 +522,7 @@ export default function App() {
                   step={1}
                   onValueChange={(val: number[]) => {
                     if (instrumentalRef.current && vocalRef.current) {
-                      instrumentalRef.current.currentTime = val[0];
-                      vocalRef.current.currentTime = val[0];
-                      setCurrentTime(val[0]);
+                      seek(val[0]);
                     }
                   }}
                   className="flex-1 cursor-pointer"
@@ -566,7 +556,7 @@ export default function App() {
                     <span className="text-white/50 text-[10px]">Ajustá el cantante original</span>
                   </div>
                   <Slider 
-                    value={vocalVolume} 
+                    value={vocalVolume}
                     onValueChange={(val: number[]) => setVocalVolume(val)}
                     max={100} 
                     step={1}
